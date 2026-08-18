@@ -17,6 +17,41 @@ to provide several
 - `get_resource_metadata`: Retrieves metadata about a Google Ads API resource type, for example "campaign". This is useful to understand the structure of the data and what fields are available for querying.
 - `list_accessible_customers`: Returns ids of customers directly accessible
   by the user authenticating the call.
+- Guarded write tools under the `changes` namespace:
+  `preview_*` and `apply_*` pairs for campaign status, campaign budgets,
+  keyword status, ad-group negative keywords, and ad final URLs.
+
+### Guarded write workflow
+
+Write tools are disabled until an explicit customer allowlist and a signing
+key are configured. Every supported change follows the same two-step flow:
+
+1. A `preview_*` tool reads the live object, validates the proposed mutation
+   with the Google Ads API using `validate_only`, and returns a short-lived,
+   signed change set. It does not change account state.
+2. The matching `apply_*` tool requires the exact approval statement returned
+   by the preview, verifies the signature and expiry, re-reads the live object,
+   aborts on drift, applies only that change, and verifies the result.
+
+The initial write surface deliberately excludes deletes, account-access
+changes, bidding-strategy changes, conversion configuration, customer-data
+uploads, and bulk mutations. Shared budgets are blocked, budget increases are
+capped at 10 percent, and landing-page hosts must be allowlisted.
+
+Configure these environment variables before enabling write use:
+
+- `GOOGLE_ADS_MCP_ALLOWED_CUSTOMER_IDS`: Comma-separated Google Ads customer
+  IDs permitted for writes. Hyphens are accepted.
+- `GOOGLE_ADS_MCP_CHANGESET_SIGNING_KEY`: Secret with at least 32 characters
+  used to sign change sets. Store it in a secret manager and keep it stable
+  across server instances.
+- `GOOGLE_ADS_MCP_CHANGESET_TTL_SECONDS`: Optional approval lifetime in
+  seconds. Defaults to 900 and is capped at 3600.
+- `GOOGLE_ADS_MCP_ALLOWED_FINAL_URL_HOSTS`: Comma-separated exact hostnames
+  permitted for final-URL changes.
+
+An MCP client's permission prompt is an additional control, not a replacement
+for the server-side preview and approval boundary.
 
 ### Configuring and Namespacing Tools
 
@@ -111,6 +146,10 @@ To enable it, set the following environment variables:
 - `GOOGLE_ADS_MCP_STORAGE_FIRESTORE_DATABASE`: (Optional) Firestore database name for `firestore` persistent storage. Defaults to `(default)`.
 - `GOOGLE_ADS_MCP_STORAGE_ENCRYPTION_KEY`: (Optional) Encryption key for stored OAuth tokens.
 - `GOOGLE_ADS_MCP_STORAGE_DISABLE_ENCRYPTION`: (Optional) Set to `true` to disable token encryption.
+- `GOOGLE_ADS_MCP_ALLOWED_CUSTOMER_IDS`: Required to enable guarded write tools.
+- `GOOGLE_ADS_MCP_CHANGESET_SIGNING_KEY`: Required to create and apply signed change sets.
+- `GOOGLE_ADS_MCP_CHANGESET_TTL_SECONDS`: Optional signed change-set lifetime.
+- `GOOGLE_ADS_MCP_ALLOWED_FINAL_URL_HOSTS`: Required for ad final-URL changes.
 
 The `redis` and `firestore` backends need their storage library installed
 alongside the server: `pip install py-key-value-aio[redis]` and
@@ -333,6 +372,15 @@ Make sure to set the required environment variables:
 - `GOOGLE_ADS_MCP_BASE_URL`: The base URL where your MCP server is accessible: this will be automatically assigned by Google Cloud Run after your first deployment. You can update the environment variables after deployment. 
 - `GOOGLE_ADS_MCP_JWT_SIGNING_KEY`: (Recommended for production) Persistent JWT signing key across Cloud Run instances.
 - `GOOGLE_ADS_MCP_STORAGE_TYPE`: (Recommended for production) Storage backend to persist OAuth tokens across instances. Set it to `firestore` to use Firestore through Application Default Credentials, which needs no VPC connector, or to `redis` along with `GOOGLE_ADS_MCP_STORAGE_REDIS_URL`.
+- `GOOGLE_ADS_LOGIN_CUSTOMER_ID`: Manager-account customer ID when the target
+  account is reached through a Google Ads manager account.
+- `GOOGLE_ADS_MCP_ALLOWED_CUSTOMER_IDS`: Comma-separated target accounts that
+  this deployment may modify.
+- `GOOGLE_ADS_MCP_CHANGESET_SIGNING_KEY`: A stable random secret of at least
+  32 characters. Prefer a Cloud Run secret reference rather than plaintext.
+- `GOOGLE_ADS_MCP_CHANGESET_TTL_SECONDS`: Optional; defaults to 900 seconds.
+- `GOOGLE_ADS_MCP_ALLOWED_FINAL_URL_HOSTS`: Exact landing-page hosts permitted
+  for final-URL changes.
 
   Using `firestore` requires three things: build the image with the extra
   installed (change the Dockerfile to `uv pip install --system .[firestore]`),
@@ -351,7 +399,8 @@ gcloud run deploy google-ads-mcp \
   --platform managed \
   --region us-central1 \
   --allow-unauthenticated \
-  --set-env-vars="GOOGLE_PROJECT_ID=YOUR_PROJECT_ID,GOOGLE_ADS_DEVELOPER_TOKEN=YOUR_DEVELOPER_TOKEN,GOOGLE_ADS_MCP_OAUTH_CLIENT_ID=YOUR_CLIENT_ID,GOOGLE_ADS_MCP_OAUTH_CLIENT_SECRET=YOUR_CLIENT_SECRET,GOOGLE_ADS_MCP_BASE_URL=YOUR_BASE_URL,GOOGLE_ADS_MCP_JWT_SIGNING_KEY=YOUR_JWT_SIGNING_KEY,GOOGLE_ADS_MCP_STORAGE_TYPE=firestore,FASTMCP_HOST=0.0.0.0"
+  --set-env-vars="GOOGLE_PROJECT_ID=YOUR_PROJECT_ID,GOOGLE_ADS_DEVELOPER_TOKEN=YOUR_DEVELOPER_TOKEN,GOOGLE_ADS_MCP_OAUTH_CLIENT_ID=YOUR_CLIENT_ID,GOOGLE_ADS_MCP_OAUTH_CLIENT_SECRET=YOUR_CLIENT_SECRET,GOOGLE_ADS_MCP_BASE_URL=YOUR_BASE_URL,GOOGLE_ADS_MCP_JWT_SIGNING_KEY=YOUR_JWT_SIGNING_KEY,GOOGLE_ADS_MCP_STORAGE_TYPE=firestore,GOOGLE_ADS_LOGIN_CUSTOMER_ID=YOUR_MANAGER_CUSTOMER_ID,GOOGLE_ADS_MCP_ALLOWED_CUSTOMER_IDS=YOUR_TARGET_CUSTOMER_ID,GOOGLE_ADS_MCP_CHANGESET_TTL_SECONDS=900,GOOGLE_ADS_MCP_ALLOWED_FINAL_URL_HOSTS=YOUR_LANDING_PAGE_HOST,FASTMCP_HOST=0.0.0.0" \
+  --set-secrets="GOOGLE_ADS_MCP_CHANGESET_SIGNING_KEY=google-ads-mcp-changeset-key:latest"
 ```
 
 ### Step 3: Configure MCP Client

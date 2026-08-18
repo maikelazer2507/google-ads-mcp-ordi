@@ -4,6 +4,7 @@
 .python-version
 .gemini
 .vscode
+.venv/
 
 # Distribution / packaging
 .Python
