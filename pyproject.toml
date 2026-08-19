@@ -4,9 +4,9 @@ version = "0.0.1"
 requires-python = ">=3.10"
 license = "Apache-2.0"
 dependencies = [
-    "google-ads>=31.2.0",
-    "mcp[cli]>=1.2.0",
-    "fastmcp>=3.2.0"
+    "google-ads>=31.2.0,<32",
+    "mcp[cli]>=1.2.0,<2",
+    "fastmcp>=3.2.0,<4"
 ]
 
 description = "MCP Server for Google Ads, depends on Google Ads API."
@@ -20,20 +20,39 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
+build = [
+    # Kept in uv.lock so --no-build-isolation never fetches an unreviewed backend.
+    "hatchling ==1.27.0",
+    "editables ==0.5"
+]
 dev = [
-    "black",
-    "nox >=2025.5.1, <2026"
+    "bandit >=1.8.6, <2",
+    "black >=25.1.0, <27",
+    "coverage >=7.10.0, <8",
+    "nox >=2025.5.1, <2026",
+    "pip-audit >=2.9.0, <3",
+    "pyfakefs >=5.9.2, <6"
 ]
 firestore = [
     # 0.4.5 is the first release exposing the Firestore sanitization strategies.
     "py-key-value-aio[firestore] >=0.4.5, <0.5.0"
 ]
+llm-tests = [
+    "google-genai >=1.30.0, <2"
+]
 
 [project.urls]
-homepage = "https://github.com/googleads/google-ads-mcp"
-repository = "https://github.com/googleads/google-ads-mcp.git"
-issues = "https://github.com/googleads/google-ads-mcp/issues"
+homepage = "https://github.com/maikelazer2507/google-ads-mcp-ordi"
+repository = "https://github.com/maikelazer2507/google-ads-mcp-ordi.git"
+issues = "https://github.com/maikelazer2507/google-ads-mcp-ordi/issues"
 
 [project.scripts]
 google-ads-mcp = "ads_mcp.server:run_server"
 google-ads-mcp-update-gaql = "ads_mcp.update_references:update_gaql_resource_file"
+
+[build-system]
+requires = ["hatchling==1.27.0", "editables==0.5"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["ads_mcp"]

@@ -14,8 +14,11 @@
 
 """Test cases for the search tool."""
 
+import os
 import unittest
 from unittest.mock import MagicMock, patch, mock_open
+
+from fastmcp.exceptions import ToolError
 
 from ads_mcp.tools import search
 
@@ -42,15 +45,19 @@ class TestSearch(unittest.TestCase):
             {"id": 2, "name": "C2"},
         ]
 
-        # Call search
-        results = search.search(
-            customer_id="1234567890",
-            fields=["campaign.id", "campaign.name"],
-            resource="campaign",
-            conditions=["campaign.status = 'ENABLED'"],
-            orderings=["campaign.name ASC"],
-            limit=10,
-        )
+        with patch.dict(
+            os.environ,
+            {"GOOGLE_ADS_MCP_READ_CUSTOMER_IDS": "1234567890"},
+            clear=True,
+        ):
+            results = search.search(
+                customer_id="1234567890",
+                fields=["campaign.id", "campaign.name"],
+                resource="campaign",
+                conditions=["campaign.status = 'ENABLED'"],
+                orderings=["campaign.name ASC"],
+                limit=10,
+            )
 
         # Verify query
         expected_query = (
@@ -121,17 +128,111 @@ class TestSearch(unittest.TestCase):
         mock_service.search_stream.side_effect = mock_ex
 
         # Call search and verify it raises ToolError
-        from fastmcp.exceptions import ToolError
-
-        with self.assertRaises(ToolError) as context:
-            search.search(
-                customer_id="1234567890",
-                fields=["invalid_field"],
-                resource="campaign",
-            )
+        with patch.dict(
+            os.environ,
+            {"GOOGLE_ADS_MCP_READ_CUSTOMER_IDS": "1234567890"},
+            clear=True,
+        ):
+            with self.assertRaises(ToolError) as context:
+                search.search(
+                    customer_id="1234567890",
+                    fields=["invalid_field"],
+                    resource="campaign",
+                )
 
         # Verify error message
         self.assertIn(
             "Google Ads API Error: Invalid field name", str(context.exception)
         )
         self.assertIn("Request ID: req-123", str(context.exception))
+
+    def test_search_defaults_to_bounded_limit(self):
+        mock_service = MagicMock()
+        mock_service.search_stream.return_value = []
+        with (
+            patch.dict(
+                os.environ,
+                {"GOOGLE_ADS_MCP_READ_CUSTOMER_IDS": "1234567890"},
+                clear=True,
+            ),
+            patch(
+                "ads_mcp.utils.get_googleads_service",
+                return_value=mock_service,
+            ),
+        ):
+            search.search("1234567890", ["campaign.id"], "campaign")
+        query = mock_service.search_stream.call_args.kwargs["query"]
+        self.assertIn(" LIMIT 500 ", query)
+
+    def test_search_rejects_query_clause_in_condition(self):
+        with patch.dict(
+            os.environ,
+            {"GOOGLE_ADS_MCP_READ_CUSTOMER_IDS": "1234567890"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ToolError, "forbidden"):
+                search.search(
+                    "1234567890",
+                    ["campaign.id"],
+                    "campaign",
+                    conditions=["campaign.id > 0 LIMIT 10000"],
+                )
+
+    def test_search_rejects_order_by_smuggling_in_condition(self):
+        with patch.dict(
+            os.environ,
+            {"GOOGLE_ADS_MCP_READ_CUSTOMER_IDS": "1234567890"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ToolError, "forbidden"):
+                search.search(
+                    "1234567890",
+                    ["campaign.id"],
+                    "campaign",
+                    conditions=[
+                        "campaign.status = 'ENABLED' ORDER BY campaign.id"
+                    ],
+                )
+
+    def test_search_caps_ordering_count(self):
+        with patch.dict(
+            os.environ,
+            {"GOOGLE_ADS_MCP_READ_CUSTOMER_IDS": "1234567890"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ToolError, "At most 10 orderings"):
+                search.search(
+                    "1234567890",
+                    ["campaign.id"],
+                    "campaign",
+                    orderings=["campaign.id ASC"] * 11,
+                )
+
+    def test_search_blocks_sensitive_resources(self):
+        with patch.dict(
+            os.environ,
+            {"GOOGLE_ADS_MCP_READ_CUSTOMER_IDS": "1234567890"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ToolError, "blocked"):
+                search.search(
+                    "1234567890",
+                    ["lead_form_submission_data.resource_name"],
+                    "lead_form_submission_data",
+                )
+
+    def test_search_sensitive_resource_has_no_environment_override(self):
+        with patch.dict(
+            os.environ,
+            {
+                "GOOGLE_ADS_MCP_READ_CUSTOMER_IDS": "1234567890",
+                "GOOGLE_ADS_MCP_ALLOW_SENSITIVE_READS": "true",
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ToolError, "blocked"):
+                search.search(
+                    "1234567890",
+                    ["click_view.gclid"],
+                    "click_view",
+                )

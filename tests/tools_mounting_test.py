@@ -34,6 +34,9 @@ class TestToolsMounting(unittest.IsolatedAsyncioTestCase):
                     "customers": True,
                     "search": True,
                     "metadata": True,
+                    "diagnostics": True,
+                    "audit": True,
+                    "changes": True,
                 }
             }
         )
@@ -48,6 +51,10 @@ class TestToolsMounting(unittest.IsolatedAsyncioTestCase):
         self.assertIn("customers_list_accessible_customers", tool_names)
         self.assertIn("search_search", tool_names)
         self.assertIn("metadata_get_resource_metadata", tool_names)
+        self.assertIn("diagnostics_account_configuration_audit", tool_names)
+        self.assertIn("audit_get_change_set_status", tool_names)
+        self.assertIn("changes_preview_campaign_status_change", tool_names)
+        self.assertIn("changes_apply_campaign_status_change", tool_names)
 
     @patch("ads_mcp.config.ToolsConfig.load")
     async def test_mounting_disabled_namespaces(self, mock_load):

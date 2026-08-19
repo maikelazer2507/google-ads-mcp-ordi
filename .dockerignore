@@ -1,0 +1,37 @@
+.git
+.github
+.gitignore
+.agents
+.codex
+.gemini
+.venv
+.nox
+__pycache__
+*.py[cod]
+*.egg-info
+.coverage
+coverage.xml
+.pytest_cache
+.mypy_cache
+.ruff_cache
+build
+dist
+deploy
+docs
+tests
+
+# Credentials, local configuration and editor/OS artifacts must never enter
+# the build context. The application receives secrets from Secret Manager.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*credentials*.json
+*client_secret*.json
+google-ads.yaml
+.DS_Store
+.idea
+.vscode
