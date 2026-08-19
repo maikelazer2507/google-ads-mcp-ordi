@@ -19,6 +19,7 @@ from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 import ads_mcp.utils as utils
+from ads_mcp.access_policy import filter_accessible_customers
 
 from google.ads.googleads.v25.services.types.customer_service import (
     ListAccessibleCustomersResponse,
@@ -41,8 +42,5 @@ def list_accessible_customers() -> List[str]:
     accessible_customers: ListAccessibleCustomersResponse = (
         ga_service.list_accessible_customers()
     )
-    # remove customer/ from the start of each resource
-    return [
-        cust_rn.removeprefix("customers/")
-        for cust_rn in accessible_customers.resource_names
-    ]
+    # Never reveal manager/customer accounts outside this deployment's scope.
+    return filter_accessible_customers(accessible_customers.resource_names)

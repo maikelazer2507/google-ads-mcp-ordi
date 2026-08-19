@@ -1,22 +1,52 @@
-# Use a slim Python image
-FROM python:3.11-slim
+# syntax=docker/dockerfile:1.7
 
-# Install uv
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+# The defaults are immutable version tags for local development. Production
+# builds MUST override both arguments with publisher-verified digest references;
+# deploy/build-release.sh enforces that policy.
+ARG PYTHON_IMAGE=python:3.11.13-slim-bookworm
+ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.11.33
 
-# Set the working directory in the container
+FROM ${UV_IMAGE} AS uv
+
+FROM ${PYTHON_IMAGE} AS builder
+
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_NO_CACHE=1
+
 WORKDIR /app
 
-# Copy the project files into the container
-COPY . .
+COPY --from=uv /uv /uvx /usr/local/bin/
+COPY pyproject.toml uv.lock README.md LICENSE ./
+COPY ads_mcp ./ads_mcp
 
-# Install the project and its dependencies
-# We use --system to install into the system Python environment in the container
-RUN uv pip install --system ".[firestore]"
+# Seed the locked build backend, then build without PEP 517 network isolation.
+# The final sync drops the build-only extra from the runtime environment.
+RUN uv sync --frozen --no-install-project --no-dev \
+        --extra firestore --extra build \
+    && uv sync --frozen --no-dev --extra firestore --no-editable \
+        --no-build-isolation
 
-# Expose port 8080 (default for Cloud Run)
+FROM ${PYTHON_IMAGE} AS runtime
+
+ENV HOME=/home/app \
+    PATH=/app/.venv/bin:$PATH \
+    FASTMCP_CHECK_FOR_UPDATES=off \
+    FASTMCP_SHOW_SERVER_BANNER=false \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN groupadd --system --gid 65532 app \
+    && useradd --system --uid 65532 --gid 65532 \
+        --create-home --home-dir /home/app app
+
+WORKDIR /app
+
+COPY --from=builder --chown=65532:65532 /app/.venv /app/.venv
+
+USER 65532:65532
+
 EXPOSE 8080
+STOPSIGNAL SIGTERM
 
-# Define the command to run the server
-# This uses the entry point defined in pyproject.toml
 CMD ["google-ads-mcp"]

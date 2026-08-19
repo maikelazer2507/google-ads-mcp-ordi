@@ -2,72 +2,241 @@ name: CI
 
 on:
   pull_request:
-    branches: [ main ]
+    branches: [main]
   push:
-    branches: [ main ]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_google_ads_integration:
+        description: Run read and validate-only contracts against the Ads test account
+        required: false
+        default: false
+        type: boolean
+      run_llm_tests:
+        description: Run the optional Gemini tool-selection tests
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FASTMCP_CHECK_FOR_UPDATES: "off"
+  FASTMCP_SHOW_SERVER_BANNER: "false"
+  PYTHON_VERSION: "3.11"
+  UV_VERSION: "0.11.33"
+  UV_CACHE_DIR: ${{ github.workspace }}/.uv-cache
 
 jobs:
-  lint:
+  quality:
+    name: Format, unit and smoke tests (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install black nox
-      - name: Run lint
-        run: nox -s lint
-
-  tests:
-    runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install nox
-      - name: Run tests
-        run: nox -s tests-${{ matrix.python-version }}
 
-  smoke-tests:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install nox .
-      - name: Run smoke tests
-        run: nox -s smoke_tests
+      - name: Install pinned uv
+        run: python -m pip install --disable-pip-version-check "uv==${UV_VERSION}"
 
-  llm-tests:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-      - name: Install dependencies
+      - name: Verify and install lock file
         run: |
-          python -m pip install --upgrade pip
-          pip install nox . google-genai
-      - name: Run LLM tests
+          uv lock --check
+          uv sync --frozen --no-install-project --extra dev --extra firestore --extra build
+          uv sync --frozen --extra dev --extra firestore --extra build --no-build-isolation
+
+      - name: Check formatting
+        run: >-
+          uv run black --check --target-version py310 --line-length 80
+          ads_mcp tests
+
+      - name: Compile source
+        run: uv run python -m compileall -q ads_mcp
+
+      - name: Run unit and deterministic smoke tests
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: nox -s llm_tests
+          GEMINI_API_KEY: ""
+          GOOGLE_ADS_MCP_ENVIRONMENT: development
+          GOOGLE_ADS_MCP_PRODUCTION_MODE: "false"
+          GOOGLE_ADS_MCP_TRANSPORT: stdio
+        run: |
+          uv run python -m unittest discover -s tests -p '*_test.py'
+          uv run python -m unittest tests/smoke/smoke_test.py
+
+      - name: Exercise deployment plans without cloud access
+        if: matrix.python-version == '3.11'
+        run: bash deploy/plan-self-test.sh
+
+  security:
+    name: Dependency, code and secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install pinned uv and locked dependencies
+        run: |
+          python -m pip install --disable-pip-version-check "uv==${UV_VERSION}"
+          uv sync --frozen --no-install-project --extra dev --extra firestore --extra build
+          uv sync --frozen --extra dev --extra firestore --extra build --no-build-isolation
+
+      - name: Audit locked Python environment
+        run: uv run pip-audit --strict --progress-spinner=off
+
+      - name: Reject high-confidence, high-severity Python findings
+        run: uv run bandit -q -r ads_mcp --severity-level high --confidence-level high
+
+      - name: Detect obvious committed credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          pattern='(-----BEGIN [A-Z ]*PRIVATE KEY-----|AIza[0-9A-Za-z_-]{35}|sk-[0-9A-Za-z]{32,})'
+          if git grep -nE "$pattern" -- . ':!uv.lock'; then
+            echo 'Potential credential material found in tracked files.' >&2
+            exit 1
+          fi
+
+  container:
+    name: Container build and scan
+    needs: [quality, security]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Build runtime image
+        run: docker build --pull --tag "local/google-ads-mcp:${GITHUB_SHA}" .
+
+      - name: Verify non-root runtime and imports
+        run: |
+          test "$(docker image inspect --format '{{.Config.User}}' "local/google-ads-mcp:${GITHUB_SHA}")" = '65532:65532'
+          docker run --rm --entrypoint python "local/google-ads-mcp:${GITHUB_SHA}" \
+            -c 'import ads_mcp; import google.ads.googleads; import fastmcp'
+
+      - name: Scan source configuration
+        run: >-
+          docker run --rm
+          -v "${GITHUB_WORKSPACE}:/workspace:ro"
+          aquasec/trivy:0.74.0@sha256:ee940acbf1f58ebadb42d01434ce4609530bf1b52536afbd1eee66cd7123c5c9
+          config --exit-code 1 --severity HIGH,CRITICAL /workspace
+
+      - name: Scan image for critical fixed vulnerabilities
+        run: >-
+          docker run --rm
+          -v /var/run/docker.sock:/var/run/docker.sock
+          aquasec/trivy:0.74.0@sha256:ee940acbf1f58ebadb42d01434ce4609530bf1b52536afbd1eee66cd7123c5c9
+          image --exit-code 1 --ignore-unfixed --severity CRITICAL
+          "local/google-ads-mcp:${GITHUB_SHA}"
+
+  google-ads-test-account:
+    name: Google Ads test-account integration (manual, no applied writes)
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.run_google_ads_integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: google-ads-test
+    env:
+      GOOGLE_ADS_DEVELOPER_TOKEN: ${{ secrets.GOOGLE_ADS_TEST_DEVELOPER_TOKEN }}
+      GOOGLE_ADS_LOGIN_CUSTOMER_ID: ${{ secrets.GOOGLE_ADS_TEST_LOGIN_CUSTOMER_ID }}
+      GOOGLE_ADS_TEST_CUSTOMER_ID: ${{ secrets.GOOGLE_ADS_TEST_CUSTOMER_ID }}
+      GOOGLE_ADS_CI_CREDENTIALS_JSON: ${{ secrets.GOOGLE_ADS_TEST_CREDENTIALS_JSON }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install pinned environment
+        run: |
+          python -m pip install --disable-pip-version-check "uv==${UV_VERSION}"
+          uv sync --frozen --no-install-project --extra dev --extra firestore --extra build
+          uv sync --frozen --extra dev --extra firestore --extra build --no-build-isolation
+
+      - name: Materialize short-lived ADC file
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in GOOGLE_ADS_DEVELOPER_TOKEN GOOGLE_ADS_TEST_CUSTOMER_ID GOOGLE_ADS_CI_CREDENTIALS_JSON; do
+            test -n "${!name:-}" || { echo "Missing protected environment secret: ${name}" >&2; exit 1; }
+          done
+          credential_file="${RUNNER_TEMP}/google-ads-ci-credentials.json"
+          printf '%s' "${GOOGLE_ADS_CI_CREDENTIALS_JSON}" > "${credential_file}"
+          chmod 600 "${credential_file}"
+          echo "GOOGLE_APPLICATION_CREDENTIALS=${credential_file}" >> "${GITHUB_ENV}"
+
+      - name: Run read and validate-only test-account integration tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d tests/integration || {
+            echo 'tests/integration is missing; live writes remain blocked.' >&2
+            exit 1
+          }
+          uv run python -m unittest discover \
+            -s tests/integration -p '*_integration_test.py'
+
+  llm-tool-selection:
+    name: LLM tool-selection tests (manual)
+    if: github.event_name == 'workflow_dispatch' && inputs.run_llm_tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: llm-tests
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install pinned environment and LLM dependency
+        run: |
+          test -n "${GEMINI_API_KEY:-}" || { echo 'GEMINI_API_KEY is not configured.' >&2; exit 1; }
+          python -m pip install --disable-pip-version-check "uv==${UV_VERSION}"
+          uv sync --frozen --no-install-project --extra dev --extra firestore --extra build --extra llm-tests
+          uv sync --frozen --extra dev --extra firestore --extra build --extra llm-tests --no-build-isolation
+
+      - name: Run LLM smoke tests
+        env:
+          GOOGLE_ADS_MCP_ENVIRONMENT: development
+          GOOGLE_ADS_MCP_PRODUCTION_MODE: "false"
+          GOOGLE_ADS_MCP_TRANSPORT: stdio
+        run: uv run python -m unittest tests/smoke/llm_test.py

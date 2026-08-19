@@ -7,4 +7,6 @@ namespaces:
   customers: true
   search: true
   metadata: true
+  diagnostics: true
+  audit: true
   changes: true

@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tools for exposing the API Search method to the MCP server."""
+"""Bounded, account-scoped Google Ads API search tools."""
 
+import logging
+import re
 from typing import Any, Dict, List
 from fastmcp import FastMCP
 from fastmcp.tools import Tool
@@ -22,8 +24,63 @@ from mcp.types import ToolAnnotations
 search_mcp = FastMCP("search")
 
 import ads_mcp.utils as utils
+from ads_mcp.access_policy import require_customer_access
 from google.ads.googleads.errors import GoogleAdsException
 from fastmcp.exceptions import ToolError
+
+logger = logging.getLogger(__name__)
+
+_IDENTIFIER = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$")
+_DEFAULT_LIMIT = 500
+_MAX_LIMIT = 2_000
+_CHANGE_EVENT_MAX_LIMIT = 10_000
+_MAX_FIELDS = 100
+_MAX_FILTERS = 30
+_MAX_ORDERINGS = 10
+_MAX_FILTER_LENGTH = 1_000
+_FORBIDDEN_FILTER_TOKENS = re.compile(
+    r"(?:;|--|/\*|\*/|\bSELECT\b|\bFROM\b|\bWHERE\b|"
+    r"\bORDER\s+BY\b|\bLIMIT\b|\bPARAMETERS\b)",
+    re.IGNORECASE,
+)
+_SENSITIVE_RESOURCES = frozenset(
+    {
+        "lead_form_submission_data",
+        "local_services_lead",
+        "local_services_lead_conversation",
+        "offline_user_data_job",
+        "click_view",
+    }
+)
+
+
+def _validate_identifier(value: str, label: str) -> str:
+    if not _IDENTIFIER.fullmatch(value):
+        raise ToolError(f"Invalid {label}: {value!r}.")
+    return value
+
+
+def _validate_filter(value: str) -> str:
+    if not value or len(value) > _MAX_FILTER_LENGTH:
+        raise ToolError(
+            f"Each condition must contain 1-{_MAX_FILTER_LENGTH} characters."
+        )
+    if _FORBIDDEN_FILTER_TOKENS.search(value):
+        raise ToolError("A condition contains a forbidden GAQL query clause.")
+    return value
+
+
+def _resolved_limit(resource: str, requested: int | None) -> int:
+    maximum = (
+        _CHANGE_EVENT_MAX_LIMIT if resource == "change_event" else _MAX_LIMIT
+    )
+    if requested is None:
+        return min(_DEFAULT_LIMIT, maximum)
+    if isinstance(requested, bool) or not isinstance(requested, int):
+        raise ToolError("limit must be an integer.")
+    if requested < 1 or requested > maximum:
+        raise ToolError(f"limit must be between 1 and {maximum}.")
+    return requested
 
 
 def search(
@@ -46,6 +103,26 @@ def search(
 
     """
 
+    customer_id = require_customer_access(customer_id, "read")
+    conditions = list(conditions or [])
+    orderings = list(orderings or [])
+    resource = _validate_identifier(resource, "resource")
+    if resource in _SENSITIVE_RESOURCES:
+        raise ToolError(
+            f"Resource {resource} is blocked because it can expose lead or "
+            "pseudonymous customer data. Use aggregate diagnostics instead."
+        )
+    if not fields or len(fields) > _MAX_FIELDS:
+        raise ToolError(f"fields must contain 1-{_MAX_FIELDS} entries.")
+    fields = [_validate_identifier(field, "field") for field in fields]
+    if len(conditions) > _MAX_FILTERS:
+        raise ToolError(f"At most {_MAX_FILTERS} conditions are allowed.")
+    conditions = [_validate_filter(condition) for condition in conditions]
+    if len(orderings) > _MAX_ORDERINGS:
+        raise ToolError(f"At most {_MAX_ORDERINGS} orderings are allowed.")
+    orderings = [_validate_filter(ordering) for ordering in orderings]
+    resolved_limit = _resolved_limit(resource, limit)
+
     ga_service = utils.get_googleads_service("GoogleAdsService")
 
     query_parts = [f"SELECT {','.join(fields)} FROM {resource}"]
@@ -56,13 +133,19 @@ def search(
     if orderings:
         query_parts.append(f" ORDER BY {','.join(orderings)}")
 
-    if limit:
-        query_parts.append(f" LIMIT {limit}")
+    query_parts.append(f" LIMIT {resolved_limit}")
 
     query_parts.append(" PARAMETERS omit_unselected_resource_names=true")
 
     query = "".join(query_parts)
-    utils.logger.info(f"ads_mcp.search query {query}")
+    # Do not log GAQL conditions: search strings can contain sensitive intent.
+    logger.info(
+        "Google Ads search customer=%s resource=%s fields=%d limit=%d",
+        customer_id,
+        resource,
+        len(fields),
+        resolved_limit,
+    )
 
     try:
         query_result = ga_service.search_stream(
@@ -75,6 +158,8 @@ def search(
                 final_output.append(
                     utils.format_output_row(row, batch.field_mask.paths)
                 )
+                if len(final_output) >= resolved_limit:
+                    return final_output
         return final_output
     except GoogleAdsException as ex:
         error_msgs = [
@@ -119,7 +204,13 @@ def _search_tool_description() -> str:
     Date ranges must be finite and must include a start and end date
 
 ### Hints for limits
-    Requests to resource change_event must specify a LIMIT of less than or equal to 10000
+    A LIMIT is always enforced. The default is 500, the maximum is 2000, and
+    change_event allows up to 10000.
+
+### Privacy
+    Lead-form, local-services-lead, click-level, and offline-user-data resources
+    are always blocked in this dental-practice edition. Use aggregate conversion
+    resources instead. Query filter text is not written to application logs.
 
 ### Hints for conversions questions
     https://developers.google.com/google-ads/api/docs/conversions/upload-summaries 
