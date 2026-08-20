@@ -1,0 +1,19 @@
+{
+  "name": "meeting-audio-notes-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP transcription backend for the Meeting Audio Notes ChatGPT plugin.",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node src/http.js",
+    "stdio": "node src/stdio.js",
+    "check": "node --check src/server.js && node --check src/elevenlabs.js && node --check src/transcript.js && node --check src/http.js && node --check src/stdio.js && node --check src/validation.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.18.0",
+    "express": "^5.1.0",
+    "zod": "^3.25.0"
+  }
+}

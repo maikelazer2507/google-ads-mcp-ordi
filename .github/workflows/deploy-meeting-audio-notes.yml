@@ -1,0 +1,76 @@
+name: Deploy Meeting Audio Notes MCP
+
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: Cloud Run region
+        required: false
+        default: europe-west3
+      service_name:
+        description: Cloud Run service name
+        required: false
+        default: meeting-audio-notes-mcp
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Enable required APIs
+        run: |
+          gcloud services enable run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com secretmanager.googleapis.com
+
+      - name: Create or update ElevenLabs secret
+        env:
+          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
+        run: |
+          set -euo pipefail
+          if ! gcloud secrets describe elevenlabs-api-key >/dev/null 2>&1; then
+            gcloud secrets create elevenlabs-api-key --replication-policy=automatic
+          fi
+          printf '%s' "$ELEVENLABS_API_KEY" | gcloud secrets versions add elevenlabs-api-key --data-file=-
+
+      - name: Grant Cloud Run runtime access to secret
+        run: |
+          PROJECT_NUMBER=$(gcloud projects describe "${{ secrets.GCP_PROJECT_ID }}" --format='value(projectNumber)')
+          RUNTIME_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+          gcloud secrets add-iam-policy-binding elevenlabs-api-key \
+            --member="serviceAccount:${RUNTIME_SA}" \
+            --role="roles/secretmanager.secretAccessor"
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy "${{ inputs.service_name }}" \
+            --source meeting-audio-notes-plugin/server \
+            --region "${{ inputs.region }}" \
+            --platform managed \
+            --allow-unauthenticated \
+            --set-secrets ELEVENLABS_API_KEY=elevenlabs-api-key:latest \
+            --memory 512Mi \
+            --cpu 1 \
+            --timeout 900 \
+            --max-instances 5 \
+            --quiet
+
+      - name: Smoke test
+        run: |
+          URL=$(gcloud run services describe "${{ inputs.service_name }}" --region "${{ inputs.region }}" --format='value(status.url)')
+          curl --fail --silent --show-error "$URL/healthz"
+          echo "MCP_URL=$URL/mcp" >> "$GITHUB_STEP_SUMMARY"
+          echo "Health=$URL/healthz" >> "$GITHUB_STEP_SUMMARY"
